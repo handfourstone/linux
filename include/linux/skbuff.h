@@ -278,11 +278,12 @@ struct nf_bridge_info {
 #endif
 
 struct sk_buff_head {
-	/* These two members must be first. */
+	/* 这两个成员必须放在最前 */
 	struct sk_buff	*next;
 	struct sk_buff	*prev;
-
+	/* qlen 代表表中元素的数目 */
 	__u32		qlen;
+	/* lock 防止对表的并发访问 */
 	spinlock_t	lock;
 };
 
@@ -568,7 +569,6 @@ static inline bool skb_mstamp_after(const struct skb_mstamp *t1,
  *	@prev: Previous buffer in list
  *	@tstamp: Time we arrived/left
  *	@rbnode: RB tree node, alternative to next/prev for netem/tcp
- *	@sk: Socket we are owned by
  *	@dev: Device we arrived on/are leaving by
  *	@cb: Control buffer. Free for use by every layer. Put private vars here
  *	@_skb_refdst: destination entry (with norefcount bit)
@@ -647,9 +647,20 @@ struct sk_buff {
 		};
 		struct rb_node	rbnode; /* used in netem & tcp stack */
 	};
+	/* 这个指针指向拥有此缓冲区的套接字的 sock 数据结构。当数据
+	 * 由本地产生或者正由本地进程接收时，就需要这个指针，因为该
+	 * 数据以及套接字相关的信息会由 L4（TCP 或者 UDP）以及用户应
+	 * 用程序使用。当缓冲区只是被转发时（也就是说本地机器既不是
+	 * 来源地址也不是目的地址），该指针就是 NULL。*/
 	struct sock		*sk;
 
 	union {
+		/* 此字段描述一个网络设备。由 dev 代表的设备角色，依赖于
+		 * 存储在该缓冲区内的封包是即将传输的还是刚被接受的而定。
+		 * 当接受到一个封包时，设备驱动程序会用代表此接受接口的
+		 * 数据结构的指针更新此字段。当传输一个封包时，此参数代表
+		 * 的是一个发送设备。
+		 * 【注】虚拟网络设备*/
 		struct net_device	*dev;
 		/* Some protocols might use this space to store information,
 		 * while device pointer would be NULL.
@@ -657,27 +668,46 @@ struct sk_buff {
 		 */
 		unsigned long		dev_scratch;
 	};
-	/*
-	 * This is the control buffer. It is free to use for every
-	 * layer. Please put your private variables there. If you
-	 * want to keep them across layers you have to do a skb_clone()
-	 * first. This is owned by whoever has the skb queued ATM.
-	 */
+	/* 这是一个“控制缓冲区(control buffer)”，或者说是私有信息
+	 * 的存储空间，为每一层内部使用起维护作用。该字段在 sk_buff
+	 * 内静态分配(48字节)，而且容量足以容纳每个层所需的私有数据。
+	 * 例如 TCP 使用这个空间来存储一个 tcp_skb_cb 的数据结构。*/
 	char			cb[48] __aligned(8);
 
 	unsigned long		_skb_refdst;
+	/* 此函数指针可以被初始化为一个函数，当此缓冲区被删除
+	 * 时，可完成某些工作。当此缓冲区不属于一个套接字时，
+	 * destructor 通常不会被初始化。当此缓冲区属于一个套
+	 * 接字时，通常设成 sock_rfree 或 sock_wfree(分别由
+	 * skb_set_owner_r 和 skb_set_owner_w 初始化函数设置)
+	 * 这两个 sock_xxx 函数可用于更新套接字队列中所持有的
+	 * 内存。*/
 	void			(*destructor)(struct sk_buff *skb);
 #ifdef CONFIG_XFRM
+	/* 由 IPsec 协议组使用，以记录转换信息 */
 	struct	sec_path	*sp;
 #endif
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	unsigned long		 _nfct;
 #endif
 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+	/* 这个参数由 Netfilter(防火墙代码)使用，更明确的讲就是由
+	 * 内核选项“Device Drivers -> Networking support ->
+	 * Networking options -> Network packet filtering”及其两个
+	 * 子选项“Network packet filtering debugging”和“Bridged
+	 * IP/ARP packets filtering”使用*/
 	struct nf_bridge_info	*nf_bridge;
 #endif
-	unsigned int		len,
-				data_len;
+	/* 这是指缓冲区中数据块的大小。这个长度包括主要缓冲区
+	 * （由 head 所指）的数据以及一些片段（fragment buffer）
+	 * 的数据，当缓冲区从一个网络分层移动往下一个网络分层时
+	 * 其值就会变化，因为在协议栈中，往上移动数据会被丢弃，
+	 * 往下移动时，报头就会被添加进来。len 也会报协议报头
+	 * 算在内。*/
+	unsigned int		len;
+	/* 与 len 不同，date_len 只计算片段中的数据大小 */
+	unsigned int		data_len;
+	/* mac 报头的大小 */
 	__u16			mac_len,
 				hdr_len;
 
@@ -696,6 +726,7 @@ struct sk_buff {
 #define CLONED_OFFSET()		offsetof(struct sk_buff, __cloned_offset)
 
 	__u8			__cloned_offset[0];
+	/* 当一个 boolean 标识置位时，表示该结构是另一个 sk_buff 的克隆 */
 	__u8			cloned:1,
 				nohdr:1,
 				fclone:2,
@@ -760,16 +791,26 @@ struct sk_buff {
 #endif
 
 #ifdef CONFIG_NET_SCHED
+	/* 这个参数由流量控制功能使用，更明确地讲就是指由内核
+	 * 选项“Device Drivers -> Networking support ->
+	 * Networking options -> Qos and/or fair queueing”及其
+	 * 子选项“Packet classifier API”使用。*/
 	__u16			tc_index;	/* traffic control index */
 #endif
 
 	union {
+		/* 这些代表校验和(checksum)以及相关联的状态标识。*/
 		__wsum		csum;
 		struct {
 			__u16	csum_start;
 			__u16	csum_offset;
 		};
 	};
+	/* 此字段表示正被传输或转发的数据包 QoS 等级。如果该封包由
+	 * 本地产生，套接字层会定义优先级的值。相反的，如果此封包
+	 * 正被转发，则函数 rt_tos2priority(由 ip_forward 函数调用)
+	 * 会根据 IP 报头本身的 ToS(Type of Service)字段的值而定义此
+	 * 字段的值。*/
 	__u32			priority;
 	int			skb_iif;
 	__u32			hash;
@@ -799,6 +840,13 @@ struct sk_buff {
 	__u16			inner_network_header;
 	__u16			inner_mac_header;
 
+	/* 从 L2 层的设备驱动程序的角度来看，就是用在下一个较高
+	 * 层的协议，典型的有 IP，IPv6，ARP(完整的见 include/
+	 * linux/if_ether.h)。由于每种协议都有自己的函数处理
+	 * 例程用来处理输入的封包，因此，驱动程序使用这个字段
+	 * 通知其上层该是用哪个处理例程。每个驱动程序会调用
+	 * netif_xxx 用来启动上面的网络分层的处理例程，所以在该
+	 * 函数被调用前 protocol 字段必须初始化。*/
 	__be16			protocol;
 	__u16			transport_header;
 	__u16			network_header;
@@ -807,13 +855,28 @@ struct sk_buff {
 	/* private: */
 	__u32			headers_end[0];
 	/* public: */
-
-	/* These elements must be at the end, see alloc_skb() for details.  */
+	/* 下面四个字段代表缓冲区的边界以及其中的数据。当每一
+	 * 分层为其工作而准备缓冲区时，可能会为一个报头或者更
+	 * 多的数据分配更多的空间。*/
+	/* 指向实际数据的结尾 */
 	sk_buff_data_t		tail;
+	/* 指向以分配缓冲区的结尾 */
 	sk_buff_data_t		end;
-	unsigned char		*head,
-				*data;
+	/* 指向以分配缓冲区的开端 */
+	unsigned char		*head;
+	/* 指向实际数据的开端 */
+	unsigned char		*data;
+	/* 此字段代表此缓冲区总的大小，包括 sk_buff 结构本身。
+	 * 当此缓冲区得到所分配的 len 个字节的数据请求空间时，
+	 * 此字段的初始化由 alloc_skb 函数设置成
+	 * len + sizeof(sk_buff)，每当 sk_buff->len 的值变化
+	 * 时，此字段就会得到更新。*/
 	unsigned int		truesize;
+	/* 引用计数，这个参数的主要用途是避免在某人依然使用此
+	 * sk_buff 的时候，就把这个 sk_buff 释放掉。因此，此缓
+	 * 冲区的每个用户在必要时都要递增或者递减此字段。此计
+	 * 数器只计算 sk_buff 数据结构的用户，此缓冲区包含的实
+	 * 际数据由一个相似的字段(dataref)所包含。*/
 	atomic_t		users;
 };
 
